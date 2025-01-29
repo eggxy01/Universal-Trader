@@ -8,11 +8,21 @@ import threading
 import time
 
 # Set page config at the top
-st.set_page_config(page_title="Market Data and Forecasting", layout="wide")
+st.set_page_config(page_title="Automated Trading System", layout="wide")
+
+# Initialize session state
+if 'data' not in st.session_state:
+    st.session_state.data = None
+if 'trades' not in st.session_state:
+    st.session_state.trades = []
 
 # Global variables for data and model
-data = None
 refresh_data_event = threading.Event()
+
+# Initialize Total balance and open positions
+Total_balance = 9753420.0  # Starting demo balance
+open_positions = []  # List to keep track of open positions
+transaction_history = []  # List to store transaction history
 
 # Symbol mapping for markets and forex pairs
 symbol_mapping = {
@@ -46,175 +56,210 @@ def fetch_market_data(symbol, interval, period='1mo'):
         st.error(f"Error fetching data for {symbol}: {e}")
         return None
 
-# Function to train a simple model on the fetched data
-@st.cache_resource
-def train_model(data):
-    data['Date'] = data.index.map(pd.Timestamp.toordinal)  # Convert dates to ordinal for modeling
-    X = data[['Date']]
-    y = data['Close']
-    model = LinearRegression()
-    model.fit(X, y)
-    return model
-
-# Function to predict future prices
-def predict_future_prices(model, last_date, days=1):
-    next_days = np.array([[pd.Timestamp(last_date + pd.Timedelta(days=i)).toordinal()] for i in range(1, days + 1)])
-    predicted_prices = model.predict(next_days)
-    return predicted_prices
-
 # Function to calculate EMA
 def calculate_ema(data, span):
-    data['EMA'] = data['Close'].ewm(span=span, adjust=False).mean()  # Add EMA directly to DataFrame
+    data['EMA'] = data['Close'].ewm(span=span, adjust=False).mean()
+    return data
+
+# Function to calculate RSI
+def calculate_rsi(data, window=14):
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=window, min_periods=1).mean()
+    avg_loss = loss.rolling(window=window, min_periods=1).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    data['RSI'] = rsi
+    return data
+
+# Function to calculate MACD
+def calculate_macd(data):
+    data['MACD'] = data['Close'].ewm(span=12, adjust=False).mean() - data['Close'].ewm(span=26, adjust=False).mean()
+    data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
     return data
 
 # Function to calculate signals based on EMA crossover
 def calculate_signals(data):
-    data['Signal'] = 0  # Default to no signal
-    data['Signal'][1:] = np.where(data['Close'][1:] > data['EMA'][1:], 1, 0)  # 1 for buy signal
-    data['Position'] = data['Signal'].diff()  # Position changes indicate buy (1) or sell (-1)
+    data['Signal'] = 0
+    data['Signal'][1:] = np.where(data['Close'][1:] > data['EMA'][1:], 1, -1)
+    data['Position'] = data['Signal'].diff()
     return data
 
-# Function to identify reversal patterns
+# Function to detect reversal patterns
 def detect_reversal_patterns(data):
-    data['Reversal'] = 0  # Default to no reversal
-    # Identify double tops and bottoms
+    data['Reversal'] = 0
     for i in range(2, len(data) - 2):
-        if data['Close'][i] > data['Close'][i - 1] and data['Close'][i] > data['Close'][i + 1]:  # Double top
-            data['Reversal'][i] = -1  # Sell signal
-        elif data['Close'][i] < data['Close'][i - 1] and data['Close'][i] < data['Close'][i + 1]:  # Double bottom
-            data['Reversal'][i] = 1  # Buy signal
+        if data['Close'][i] > data['Close'][i - 1] and data['Close'][i] > data['Close'][i + 1]:
+            data['Reversal'][i] = -1  # Potential sell signal
+        elif data['Close'][i] < data['Close'][i - 1] and data['Close'][i] < data['Close'][i + 1]:
+            data['Reversal'][i] = 1  # Potential buy signal
     return data
+
+# Function to simulate trades
+def simulate_trades(data, initial_capital=10000, risk_per_trade=0.01):
+    capital = initial_capital
+    trades = []
+    position = None
+    entry_price = 0
+
+    for i in range(len(data)):
+        if data['Position'][i] == 2:  # Buy signal
+            if position != 'long':
+                entry_price = data['Close'][i]
+                position = 'long'
+                stop_loss = entry_price * (1 - risk_per_trade)
+                take_profit = entry_price * (1 + 2 * risk_per_trade)  # Risk-reward ratio of 1:2
+                trades.append({'type': 'buy', 'price': entry_price, 'stop_loss': stop_loss, 'take_profit': take_profit, 'time': data.index[i]})
+        elif data['Position'][i] == -2:  # Sell signal
+            if position != 'short':
+                entry_price = data['Close'][i]
+                position = 'short'
+                stop_loss = entry_price * (1 + risk_per_trade)
+                take_profit = entry_price * (1 - 2 * risk_per_trade)
+                trades.append({'type': 'sell', 'price': entry_price, 'stop_loss': stop_loss, 'take_profit': take_profit, 'time': data.index[i]})
+
+        # Check if stop-loss or take-profit is hit
+        if position == 'long' and (data['Low'][i] <= stop_loss or data['High'][i] >= take_profit):
+            exit_price = stop_loss if data['Low'][i] <= stop_loss else take_profit
+            capital = capital * (exit_price / entry_price)
+            position = None
+        elif position == 'short' and (data['High'][i] >= stop_loss or data['Low'][i] <= take_profit):
+            exit_price = stop_loss if data['High'][i] >= stop_loss else take_profit
+            capital = capital * (entry_price / exit_price)
+            position = None
+
+    return trades, capital
 
 # Function to render the main page content
 def main_page():
-    st.title("Market Data and Forecasting Dashboard")
+    st.title("Automated Trading System")
+
+    # Live Balance and Open Trades Display
+    st.sidebar.header("Account Information")
+    st.sidebar.write(f"**Total Balance:** ${Total_balance:.2f}")
+    st.sidebar.write("### Open Trades")
+    if open_positions:
+        for pos in open_positions:
+            st.sidebar.write(f"{pos['action']} {pos['amount']} of {pos['symbol']} at {pos['price']:.2f}")
+    else:
+        st.sidebar.write("No open positions.")
+
+    # Display total P&L
+    total_pnl = sum((pos['current_price'] - pos['price']) * pos['amount'] for pos in open_positions)
+    st.sidebar.write(f"**Total P&L:** ${total_pnl:.2f}")
 
     # Sidebar for user input
-    st.sidebar.header("Market Selection")
+    st.sidebar.header("Trading Parameters")
     market_symbols = list(symbol_mapping.keys())
     selected_market = st.sidebar.selectbox("Select Market Symbol", market_symbols)
-
-    interval = st.sidebar.selectbox("Select Interval", ['1m', '5m', '15m', '1h', '1d'])
-    forecast_days = st.sidebar.number_input("Number of Days to Forecast", min_value=1, max_value=30, value=1)
+    interval = st.sidebar.selectbox("Select Interval", ['5m', '15m', '1h', '1d'])
     ema_span = st.sidebar.number_input("EMA Span", min_value=1, max_value=50, value=10)
+    risk_per_trade = st.sidebar.number_input("Risk per Trade (%)", min_value=0.1, max_value=5.0, value=1.0) / 100
+    initial_capital = st.sidebar.number_input("Initial Capital", min_value=1000, max_value=100000, value=10000)
 
-    # Fetching the selected market data initially
-    global data
-    data = fetch_market_data(symbol_mapping[selected_market], interval)
+    # Fetching the selected market data
+    with st.spinner("Fetching market data..."):
+        st.session_state.data = fetch_market_data(symbol_mapping[selected_market], interval)
 
-    if data is not None:
+    if st.session_state.data is not None:
         st.subheader(f"Historical Market Data for {selected_market}")
-        st.write(data)
-
-        # Train the model on the fetched data
-        model = train_model(data)
-        st.success("Initial model trained successfully!")
+        st.write(st.session_state.data)
 
         # Calculate EMA
-        data = calculate_ema(data, ema_span)  # Ensure EMA is calculated and added to the DataFrame
+        st.session_state.data = calculate_ema(st.session_state.data, ema_span)
+
+        # Calculate RSI
+        st.session_state.data = calculate_rsi(st.session_state.data)
+
+        # Calculate MACD
+        st.session_state.data = calculate_macd(st.session_state.data)
 
         # Calculate buy/sell signals based on EMA crossover
-        data = calculate_signals(data)
+        st.session_state.data = calculate_signals(st.session_state.data)
 
         # Detect reversal patterns
-        data = detect_reversal_patterns(data)
+        st.session_state.data = detect_reversal_patterns(st.session_state.data)
 
-        # Prepare data for the chart
-        last_date = data.index[-1]
-        future_prices = predict_future_prices(model, last_date, forecast_days)
+        # Simulate trades
+        trades, final_capital = simulate_trades(st.session_state.data, initial_capital, risk_per_trade)
+        st.session_state.trades = trades
 
-        # Create a DataFrame for future predictions
-        future_dates = [last_date + pd.Timedelta(days=i) for i in range(1, forecast_days + 1)]
-        future_data = pd.DataFrame(data=future_prices, index=future_dates, columns=['Predicted Close'])
+        # Display trading results
+        st.subheader("Trading Results")
+        st.write(f"Initial Capital: ${initial_capital:,.2f}")
+        st.write(f"Final Capital: ${final_capital:,.2f}")
+        st.write(f"Total Trades: {len(trades)}")
 
-        # Arrange charts side by side using columns
-        col1, col2, col3 = st.columns([1, 1, 1])  # Make columns equal width
+        # Display trades in a table
+        st.write("Trade History:")
+        st.write(pd.DataFrame(trades))
+
+        # Plot trades on the chart
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=st.session_state.data.index, y=st.session_state.data['Close'], mode='lines', name='Close', line=dict(color='blue')))
+        for trade in trades:
+            if trade['type'] == 'buy':
+                fig.add_trace(go.Scatter(x=[trade['time']], y=[trade['price']], mode='markers', name='Buy', marker=dict(color='green', size=10, symbol='triangle-up')))
+            elif trade['type'] == 'sell':
+                fig.add_trace(go.Scatter(x=[trade['time']], y=[trade['price']], mode='markers', name='Sell', marker=dict(color='red', size=10, symbol='triangle-down')))
+        fig.update_layout(title=f'{selected_market} Trades', xaxis_title='Date', yaxis_title='Price', template='plotly_dark')
+        st.plotly_chart(fig, use_container_width=True)
 
         # Candlestick Chart with Y-axis Zoom
-        with col1:
-            st.subheader("Candlestick Chart with Y-Axis Zoom")
-            candlestick_fig = go.Figure(data=[go.Candlestick(
-                x=data.index,
-                open=data['Open'],
-                high=data['High'],
-                low=data['Low'],
-                close=data['Close'],
-                name='Candlestick'
-            )])
-            candlestick_fig.update_layout(
-                title=f'{selected_market} Candlestick Chart',
-                xaxis_title='Date',
-                yaxis_title='Price',
-                template='plotly_dark',
-                xaxis=dict(rangeslider=dict(visible=True), type="date"),
-                yaxis=dict(fixedrange=False)
-            )
-            st.plotly_chart(candlestick_fig, use_container_width=True)
+        st.subheader("Candlestick Chart with Y-Axis Zoom")
+        candlestick_fig = go.Figure(data=[go.Candlestick(
+            x=st.session_state.data.index,
+            open=st.session_state.data['Open'],
+            high=st.session_state.data['High'],
+            low=st.session_state.data['Low'],
+            close=st.session_state.data['Close'],
+            name='Candlestick'
+        )])
+        candlestick_fig.update_layout(
+            title=f'{selected_market} Candlestick Chart',
+            xaxis_title='Date',
+            yaxis_title='Price',
+            template='plotly_dark',
+            xaxis=dict(rangeslider=dict(visible=True), type="date"),
+            yaxis=dict(fixedrange=False)
+        )
+        st.plotly_chart(candlestick_fig, use_container_width=True)
 
         # Closing Price & EMA Chart
-        with col2:
-            st.subheader("Closing Price & EMA")
-            fig1 = go.Figure()
-            fig1.add_trace(
-                go.Scatter(x=data.index, y=data['Close'], mode='lines', name='Close', line=dict(color='blue')) )
-            fig1.add_trace(go.Scatter(x=data.index, y=data['EMA'], mode='lines', name='EMA', line=dict(color='orange')) )
-            fig1.update_layout(title=f'{selected_market} Closing Prices with EMA', xaxis_title='Date',
-                               yaxis_title='Price', template='plotly_dark')
-            st.plotly_chart(fig1, use_container_width=True)
-
-        # Future Price Prediction Chart
-        with col3:
-            st.subheader("Future Price Prediction")
-            fig2 = go.Figure()
-            fig2.add_trace(
-                go.Scatter(x=future_data.index, y=future_data['Predicted Close'], mode='lines', name='Predicted Close',
-                           line=dict(color='red')) )
-            fig2.update_layout(title=f'{selected_market} Predicted Prices', xaxis_title='Date', yaxis_title='Price',
-                               template='plotly_dark')
-            st.plotly_chart(fig2, use_container_width=True)
+        st.subheader("Closing Price & EMA")
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(x=st.session_state.data.index, y=st.session_state.data['Close'], mode='lines', name='Close', line=dict(color='blue')))
+        fig1.add_trace(go.Scatter(x=st.session_state.data.index, y=st.session_state.data['EMA'], mode='lines', name='EMA', line=dict(color='orange')))
+        fig1.update_layout(title=f'{selected_market} Closing Prices with EMA', xaxis_title='Date', yaxis_title='Price', template='plotly_dark')
+        st.plotly_chart(fig1, use_container_width=True)
 
         # Combined Buy/Sell and Reversal Signals Chart
-        with st.expander("Combined Buy/Sell and Reversal Signals"):
-            combined_signal_fig = go.Figure()
-            combined_signal_fig.add_trace(
-                go.Scatter(x=data.index, y=data['Close'], mode='lines', name='Close', line=dict(color='blue')) )
-            combined_signal_fig.add_trace(go.Scatter(x=data.index[data['Position'] == 1],
-                                                     y=data['Close'][data['Position'] == 1],
-                                                     mode='markers',
-                                                     name='Buy Signal',
-                                                     marker=dict(color='green', size=10, symbol='triangle-up')) )
-            combined_signal_fig.add_trace(go.Scatter(x=data.index[data['Position'] == -1],
-                                                     y=data['Close'][data['Position'] == -1],
-                                                     mode='markers',
-                                                     name='Sell Signal',
-                                                     marker=dict(color='red', size=10, symbol='triangle-down')) )
-            combined_signal_fig.add_trace(go.Scatter(x=data.index[data['Reversal'] == 1],
-                                                     y=data['Close'][data['Reversal'] == 1],
-                                                     mode='markers',
-                                                     name='Reversal Buy',
-                                                     marker=dict(color='purple', size=10, symbol='x')) )
-            combined_signal_fig.add_trace(go.Scatter(x=data.index[data['Reversal'] == -1],
-                                                     y=data['Close'][data['Reversal'] == -1],
-                                                     mode='markers',
-                                                     name='Reversal Sell',
-                                                     marker=dict(color='orange', size=10, symbol='x')) )
-            combined_signal_fig.update_layout(title='Combined Signals', xaxis_title='Date', yaxis_title='Price',
-                                               template='plotly_dark')
-            st.plotly_chart(combined_signal_fig, use_container_width=True)
-
-    # Terms and conditions (HTML section)
-    with st.expander("Terms and Conditions"):
-        html_code = """
-        <h2>Terms and Conditions</h2>
-        <p>By using this platform, you agree to the following terms:</p>
-        <ul>
-            <li>All market data is for informational purposes only.</li>
-            <li>Trading involves risks, and past performance is not indicative of future results.</li>
-            <li>We do not provide financial advice.</li>
-        </ul>
-        <p>Please read carefully before proceeding with any trading activity.</p>
-        """
-        st.markdown(html_code, unsafe_allow_html=True)
+        st.subheader("Combined Buy/Sell and Reversal Signals")
+        combined_signal_fig = go.Figure()
+        combined_signal_fig.add_trace(go.Scatter(x=st.session_state.data.index, y=st.session_state.data['Close'], mode='lines', name='Close', line=dict(color='blue')))
+        combined_signal_fig.add_trace(go.Scatter(x=st.session_state.data.index[st.session_state.data['Position'] == 1],
+                                                 y=st.session_state.data['Close'][st.session_state.data['Position'] == 1],
+                                                 mode='markers',
+                                                 name='Buy Signal',
+                                                 marker=dict(color='green', size=10, symbol='triangle-up')))
+        combined_signal_fig.add_trace(go.Scatter(x=st.session_state.data.index[st.session_state.data['Position'] == -1],
+                                                 y=st.session_state.data['Close'][st.session_state.data['Position'] == -1],
+                                                 mode='markers',
+                                                 name='Sell Signal',
+                                                 marker=dict(color='red', size=10, symbol='triangle-down')))
+        combined_signal_fig.add_trace(go.Scatter(x=st.session_state.data.index[st.session_state.data['Reversal'] == 1],
+                                                 y=st.session_state.data['Close'][st.session_state.data['Reversal'] == 1],
+                                                 mode='markers',
+                                                 name='Reversal Buy',
+                                                 marker=dict(color='purple', size=10, symbol='x')))
+        combined_signal_fig.add_trace(go.Scatter(x=st.session_state.data.index[st.session_state.data['Reversal'] == -1],
+                                                 y=st.session_state.data['Close'][st.session_state.data['Reversal'] == -1],
+                                                 mode='markers',
+                                                 name='Reversal Sell',
+                                                 marker=dict(color='orange', size=10, symbol='x')))
+        combined_signal_fig.update_layout(title='Combined Signals', xaxis_title='Date', yaxis_title='Price', template='plotly_dark')
+        st.plotly_chart(combined_signal_fig, use_container_width=True)
 
 # Function to handle real-time data updates
 def refresh_data():
